@@ -1,0 +1,91 @@
+#!/bin/sh
+#: Title       : Max3_1
+#: Date        : 2016-05-17
+#: Author      : "Kybernetes" <correodelkybernetes@gmail.com>
+#: Version     : 1.1.0
+#: Description : Executable Dash shell script
+#:             : Finds 
+#: Options     : N/A
+##
+## -- Externals required for execution -----------------------------------------
+type awk >/dev/null || exit 1   ## Pattern scanning and processing language
+type date >/dev/null || exit 1  ## Get system's time
+type sleep >/dev/null || exit 1 ## Delay execution for some time
+##
+## -- Functions ----------------------------------------------------------------
+stdmsg() { #@ DESCRIPTION: Print messages to STDOUT
+           #@ USAGE: stdmsg [ MSG ... ]
+    [ "${1+X}" = X ] && printf "%s\n" "$@"
+}
+errmsg() { #@ DESCRIPTION: Print messages to STDERR prefixed by an error stamp
+           #@ USAGE: stderr [ MSG ... ]
+    stdmsg ${1+"Error! $@"} >&2
+}
+setvar() { #@ DESCRIPTION: Sets $1 variable specified by reference, to $2 value.
+           #@ USAGE: setvar NAME [ VALUE ]
+           #@        /!\ - WARNING! - /!\ $1 must be a valid name
+    eval "$1=\${2+\"\$2\"}" ## Without the right side backslash, escaped chars
+                            ## won't be part of assignment
+}
+getvar() { #@ DESCRIPTION: Stores value of $2 referenced var in $1 name. If $2
+           #@              referenced var. is unset, so $1 name will remain and
+           #@              exit status will be 1.
+           #@ USAGE: getvar NAMEW NAMER
+           #@        /!\ - WARNING! - /!\ $1 AND $2 must be a valid names
+    eval "[ \"\${$2+X}\" = X ] && $1=\"\${$2}\"" ## Do not set $1 referenced
+                                                 ## name if $2 is also unset
+}
+_wqargs() { #@ DESCRIPTION:
+            #@ USAGE: wqpprs [ ARG1 [ ARG2 .. ] ] NAME
+    # Local variables ("local" must be function's first statement)
+    local qtd
+    while [ $# -gt 1 ]; do
+        eval "getvar qtd \$$#"
+        eval "setvar \$$# \${qtd:+\"\$qtd \"}\\\"\"\$1\"\\\""
+        shift
+    done
+}
+wqargs() { #@ DESCRIPTION:
+           #@ USAGE: NAME [ ARG1 [ ARG2 .. ] ]
+    local _$1
+    unset $1
+    set -- "$@" _$1
+    shift
+    _wqargs "$@"
+    eval "getvar \${$##_} \$$#"
+}
+tmout() { #@ DESCRIPTION: Execute command w/a timeout upon whose expiration
+          #@              SIGKILL is sent to the process. If that is blocked,
+          #@              then subsequent SIGKILL will attempt to terminate it
+          #@              after a certain delay.
+          #@ USAGE: tmout SECS COMMAND
+    # Local variables ("local" must be function's first statement)
+    local tout cmd
+    tout=$1                       ## Get first pos. par. as seconds to timeout
+    shift 1                       ## Remove it
+    wqargs cmd ${1+"$@"}
+    shift $#
+    sh -c "{                      ## Start killer process in backgnd
+intvl=1 dly=2 tout=$tout          ## Initialize interval, delay and timeout
+while [ \$tout -gt 0 ]; do        ## While we still have time
+    if ! ps -o pid -p \$$; then   ## Frgnd proc running? ($$ expnds before back)
+        wait \$$                  ## No, so wait to capture exit status
+        exit \$?                  ##     Exit w/foreground's exit stat
+    fi                            ## Yes, so..
+    sleep \$intvl                 ##      Sleep for defined interval before asking again
+    tout=\$((tout - intvl))       ## Decrease timeout
+done                              ## Now we run out of time, and the backgournd killer will do it's job
+    kill -s TERM \$$              ## Try to TERM foreground process
+    sleep \$dly                   ## Delay the KILL a bit
+    if ps -o pid -p \$$; then     ## Is foreground still running?
+        kill -s KILL \$$          ## Yes, so kill it
+        sleep \$dly               ## Await before checking again
+        if ps -o pid -p \$$; then ## If it still running then..
+            exit 3                ## Finish w/distinctive error
+        fi                        
+        exit 2                    ## Process didn't TERMINATED but KILLED
+    fi
+    exit 1                        ## Process TERMINATED
+} >/dev/null 2>&1 &               ## Fork nullifying output
+exec $cmd"             ## Replace foreground execution w/command's
+}
