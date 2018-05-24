@@ -4,13 +4,34 @@
 #: Author      : "Kybernetes" <correodelkybernetes@gmail.com>
 #: Version     : 1.1.0
 #: Description : Executable Dash shell script
-#:             : Finds 
+#:             : 
 #: Options     : N/A
 ##
 ## -- Externals required for execution -----------------------------------------
-type awk >/dev/null || exit 1   ## Pattern scanning and processing language
+type rm >/dev/null || exit 1    ## Remove files
 type date >/dev/null || exit 1  ## Get system's time
 type sleep >/dev/null || exit 1 ## Delay execution for some time
+type ps >/dev/null || exit 1    ## Get current running procs
+type find >/dev/null || exit 1  ## Search for files in a directory hierarchy
+type fuser >/dev/null || exit 1 ## Identiry procs. using files
+##
+## -- Globals ------------------------------------------------------------------
+_RPLY=            ## Internal read command reply;
+# Declare the following useful symbols:
+readonly _SP=" "  ## Space character (readonly uses word for assignment's LHS);
+readonly _HT="	" ## Horizontal tab
+readonly _LF="
+"                 ## End of line (line feed)
+##
+## -- Runtime config. ----------------------------------------------------------
+# Execution blocking currently running instance's pid file
+_PIDFILE=/tmp/${$0##*/}.pid
+# Allowed-to-clear extension colon separation list
+_FTYPELST="log:txt"
+# Allowed-to-search EOL separated directory list
+_SDIRLIST=""
+# Days between executions (Zero for more than once a day)
+_RSTINTVL=
 ##
 ## -- Functions ----------------------------------------------------------------
 stdmsg() { #@ DESCRIPTION: Print messages to STDOUT
@@ -35,24 +56,34 @@ getvar() { #@ DESCRIPTION: Stores value of $2 referenced var in $1 name. If $2
     eval "[ \"\${$2+X}\" = X ] && $1=\"\${$2}\"" ## Do not set $1 referenced
                                                  ## name if $2 is also unset
 }
-_wqargs() { #@ DESCRIPTION:
-            #@ USAGE: wqpprs [ ARG1 [ ARG2 .. ] ] NAME
+_wqargs() { #@ DESCRIPTION: Weak-quotes all but the last argument appending
+            #@              them in order, to last argument referenced name.
+            #@ USAGE: _wqpprs [ ARG1 [ ARG2 .. ] ] NAME
+            #@        /!\ - WARNINGS: - /!\
+            #@        * Last arg. must be a valid name
+            #@        * DO NOT CALL DIRECTLY, use below wrapper instead.
     # Local variables ("local" must be function's first statement)
-    local qtd
-    while [ $# -gt 1 ]; do
-        eval "getvar qtd \$$#"
+    local qtd ## Last quoted args string temporary storage
+    while [ $# -gt 1 ]; do     ## While this is not the last arg..
+        eval "getvar qtd \$$#" ## Save last arg. referenced string
+        ## Rewrite last arg. ref. string w/temp. +space +quoted current arg.
         eval "setvar \$$# \${qtd:+\"\$qtd \"}\\\"\"\$1\"\\\""
-        shift
+        shift                  ## Remove current arg from list
     done
 }
-wqargs() { #@ DESCRIPTION:
+wqargs() { #@ DESCRIPTION: Weak-quotes all but 1st arg. & storing them in order,
+           #@              to the 1st arg. referenced name using _wqargs().
+           #@              Useful for building cmds in variables during runtime.
            #@ USAGE: NAME [ ARG1 [ ARG2 .. ] ]
-    local _$1
-    unset $1
-    set -- "$@" _$1
-    shift
-    _wqargs "$@"
-    eval "getvar \${$##_} \$$#"
+           #@        /!\ - WARNING! - /!\ $1 must be a valid name
+    # Local variables ("local" must be function's first statement)
+    local _$1            ## Prefix name to safely pass it to wrapped func.
+    eval "getvar _$1 $1" ## Store previous content of $1 referenced name
+    set -- "$@" _$1      ## Append name at the end as rquired by wrapped
+    shift                ## Now we can remove first arg
+    _wqargs "$@"         ## Issue wrapped function passing all args and name
+    eval "getvar \${$##_} \$$#" ## $1 is no longer the initial name after shift
+                                ## So remove it w/var. exp. before assigning.
 }
 tmout() { #@ DESCRIPTION: Execute command w/a timeout upon whose expiration
           #@              SIGKILL is sent to the process. If that is blocked,
@@ -72,9 +103,9 @@ while [ \$tout -gt 0 ]; do        ## While we still have time
         wait \$$                  ## No, so wait to capture exit status
         exit \$?                  ##     Exit w/foreground's exit stat
     fi                            ## Yes, so..
-    sleep \$intvl                 ##      Sleep for defined interval before asking again
-    tout=\$((tout - intvl))       ## Decrease timeout
-done                              ## Now we run out of time, and the backgournd killer will do it's job
+    sleep \$intvl                 ## * Sleep for interval before asking again
+    tout=\$((tout - intvl))       ## * Decrease timeout
+done                              ## Out of time, and killer will do it's job
     kill -s TERM \$$              ## Try to TERM foreground process
     sleep \$dly                   ## Delay the KILL a bit
     if ps -o pid -p \$$; then     ## Is foreground still running?
@@ -87,5 +118,61 @@ done                              ## Now we run out of time, and the backgournd 
     fi
     exit 1                        ## Process TERMINATED
 } >/dev/null 2>&1 &               ## Fork nullifying output
-exec $cmd"             ## Replace foreground execution w/command's
+exec $cmd"                        ## Replace foreground execution w/command's
+}
+_TMPFFID=0  ## Unique incremental temporary fifo ID
+_mkTFfo() { #@ DESCRIPTION: Creates single temp fifo in /tmp for each invocation
+            #@              during current instance of script updating unique
+            #@              global ID and storing full path in $1 name.
+            #@ USAGE: _mkTFfo NAME
+            #@        /!\ - WARNINGS: - /!\
+            #@        * $1 must be a valid name
+            #@        * DO NOT CALL DIRECTLY, use mkTFfo() wrapper instead.
+    # Local variables ("local" must be function's first statement)
+    local n tffpth
+    # Initialize fifo's path and an attempts counter
+    tffpth=/tmp/${0##*/}.$$.$_TMPFFID.tmp n=0
+    # Try create while fifo exists, limiting attempts number
+    while ! mkfifo "$tffpth" 1>/dev/null 2>&1 && [ $n -lt 100 ]; do
+        if [ -e $tffpth ]; then                             ## Ffo lready there?
+            _TMPFFID=$((_TMPFFID < 999 ? _TMPFFID + 1 : 0)) ## Yes, increase ID
+            tffpth=/tmp/${0##*/}.$$.$_TMPFFID.tmp           ## and set new path
+        else                                                ## No, so problem
+            errmsg "Failed to create named pipe"            ## Display error msg
+            return 1                                        ## Report to calling
+        fi                                                  ## environment.
+        n=$((n + 1))                                ## Increase attempts counter
+    done                                            ## Now sure that ffo exists
+    _TMPFFID=$((_TMPFFID < 999 ? _TMPFFID + 1 : 0)) ## Increase global ID
+    if [ $n -gt 100 ]; then                         ## Loop finished by limit?
+        errmsg "Too many named pipes"               ## Assume too many fifos
+        return 2                                    ## Finish w/errors
+    fi
+    setvar $1 "$tffpth"
+}
+mkTFfo() { #@ DESCRIPTION: Creates single temp fifo in /tmp using _mkTFfo()
+           #@ USAGE: mkTFfo NAME
+    local _$1                ## Create prefixed storage for wrapped output
+    _mkTFfo _$1 || return $? ## Call wrapped or finish preserving error status
+    getvar $1 _$1            ## Set referenced name w/wrapped output
+}
+end() { #@ DESCRIPTION:
+        #@ USAGE:
+    # Try to remove all /tmp/${0##*/}.$$.*.tmp fifos
+    
+    # Try to remove pidfile
+    # Print report
+    # Finish w/given exit status
+}
+##
+## -- Main ---------------------------------------------------------------------
+main() {
+    #
+    # Additional runtime configuration
+    unalias -a        ## Destroy any alias that may change externals execution
+    IFS=$_SP$_HT$_LF  ## Reset IFS as it should be by default
+    # Start signal traps
+    # Find all files to delete and store list in array
+    # Filter out from list, according to finer criterion
+    # Safely delete all remaining files from list
 }
