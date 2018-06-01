@@ -1,0 +1,358 @@
+#!/bin/sh
+#: Title       : Tmpclean
+#: Date        : 2016-05-17
+#: Author      : "Kybernetes" <correodelkybernetes@gmail.com>
+#: Version     : 1.1.0
+#: Description : Executable Dash shell script
+#:             : Efficiently removes files from temp. dirs using
+#:             : * File types in names (a.k.a. extension);
+#:             : * Mtime in minutes of each temp file;
+#:             : Avoiding to remove files that are being used by a process.
+#: Options     : N/A
+##
+## -- Externals required for execution -----------------------------------------
+type rm >/dev/null || exit 1    ## Remove files
+type date >/dev/null || exit 1  ## Get system's time
+type sleep >/dev/null || exit 1 ## Delay execution for some time
+type chmod >/dev/null || exit 1 ## Set file's mode
+type ps >/dev/null || exit 1    ## Get current running procs
+type stat >/dev/null || exit 1  ## Get file status
+type fuser >/dev/null || exit 1 ## Identiry procs. using files
+type timeout >/dev/null || exit 1
+##
+## -- Runtime config. ----------------------------------------------------------
+_RPLY=            ## Internal read command reply;
+# Declare the following useful symbols:
+readonly _SP=" "  ## Space character (readonly uses word for assignment's LHS);
+readonly _HT="	" ## Horizontal tab
+readonly _LF="
+"                 ## End of line (line feed)
+# Script's name
+_PRGNME=Safeclean
+# Execution blocking currently running instance's pid file
+_PIDFILE=/tmp/${0##*/}.pid
+# Allowed-to-clear extension EOL separation list (use empty for any)
+_FTYPELST="*"
+# Allowed-to-search EOL separated directory list
+_TMPDIRLST="/usr/share/tomcat/apia/fiscalia/tmpFileStorage"
+#_TMPDIRLST="/usr/share/tomcat/apia/fiscalia/tmpFileStorage
+#/usr/share/tomcat/apia/webapps/fiscalia/sippau/carpetaCaso/tmp"
+# Temp. files max mtime to keep from now, in minutes
+_MINSKEEP=120
+# Temp. files removed for a given temp. dir
+_TMPFLSRM=0
+##
+## -- General purpose functions  -----------------------------------------------
+stdmsg() { #@ DESCRIPTION: Print messages to STDOUT
+           #@ USAGE: stdmsg [ MSG ... ]
+    local time
+    if [ "${1+X}" = X ]; then
+        time=$(date +%T 2>/dev/null) || time=HH:MM:SS
+        printf -- "==> [$time] %s\n" "$1"
+        shift
+        [ "${1+X}" != X ] || printf -- "               %s\n" "$@"
+    fi
+}
+errmsg() { #@ DESCRIPTION: Print messages to STDERR prefixed by an error stamp
+           #@ USAGE: stderr [ MSG ... ]
+    stdmsg ${1+"Error! $@"} >&2
+}
+setvar() { #@ DESCRIPTION: Sets $1 variable specified by reference, to $2 value.
+           #@ $1 MUST BE A VALID NAME!
+           #@ USAGE: setvar NAME [ VALUE ]
+           #@        /!\ - WARNING! - /!\ $1 must be a valid name
+    eval "$1=\${2+\"\$2\"}" ## Without the right side backslash, escaped chars
+                            ## won't be part of assignment
+}
+getvar() { #@ DESCRIPTION: Stores value of $2 referenced var in $1 name. If $2
+           #@              referenced var. is unset, so $1 name will remain and
+           #@              exit status will be 1.
+           #@ USAGE: getvar NAMEW NAMER
+           #@        /!\ - WARNING! - /!\ $1 AND $2 must be a valid names
+    eval "[ \"\${$2+X}\" = X ] && $1=\"\${$2}\"" ## Do not set $1 referenced
+                                                 ## name if $2 is also unset
+}
+_wqargs() { #@ DESCRIPTION: Weak-quotes all but the last argument, appending
+            #@              them in order in last argument referenced name.
+            #@ USAGE: _wqpprs [ ARG1 [ ARG2 .. ] ] NAME
+            #@        /!\ - WARNINGS: - /!\
+            #@        * Last arg. must be a valid name
+            #@        * DO NOT CALL DIRECTLY, use below wrapper instead.
+    # Local variables ("local" must be function's first statement)
+    local qtd ## Last quoted args string temporary storage
+    while [ $# -gt 1 ]; do       ## While this is not the last arg..
+        eval "getvar qtd \${$#}" ## Save last arg. referenced string
+        ## Rewrite last arg. ref. string w/temp. +space +quoted current arg.
+        eval "setvar \${$#} \${qtd:+\"\$qtd \"}\\\"\"\$1\"\\\""
+        shift                  ## Remove current arg from list
+    done
+}
+wqargs() { #@ DESCRIPTION: Weak-quotes all but 1st arg., storing them in order
+           #@              in the 1st arg. referenced name using _wqargs().
+           #@              Useful for building cmds in variables during runtime.
+           #@ USAGE: NAME [ ARG1 [ ARG2 .. ] ]
+           #@        /!\ - WARNING! - /!\ $1 must be a valid name
+    # Local variables ("local" must be function's first statement)
+    local _$1            ## Prefix name to safely pass it to wrapped function
+    eval "getvar _$1 $1" ## Store previous content of $1 referenced name
+    set -- "$@" _$1      ## Append name at the end as rquired by wrapped
+    shift                ## Now safely remove first arg
+    _wqargs "$@"         ## Issue wrapped function passing all args and name
+    eval "getvar \${$##_} \${$#}" ## $1 is no longer initial name after shift,
+                                  ## so access _$1 w/var. exp. before assigning.
+}
+tmout() { #@ DESCRIPTION: Execute command w/a timeout upon whose expiration
+          #@              SIGKILL is sent to the process. If that is blocked,
+          #@              then subsequent SIGKILL will attempt to terminate it
+          #@              after a certain delay.
+          #@ USAGE: tmout SECS COMMAND
+    # Local variables ("local" must be function's first statement)
+    local tout cmd=
+    tout=$1                       ## Get first pos. par. as seconds to timeout
+    shift 1                       ## Remove it
+    wqargs cmd ${1+"$@"}
+    shift $#
+    sh -c "{                      ## Start killer process in backgnd
+intvl=1 dly=2 tout=$tout          ## Initialize interval, delay and timeout
+while [ \$tout -gt 0 ]; do        ## While we still have time
+    if ! ps -o pid -p \$$; then   ## Frgnd proc running? ($$ expnds before back)
+        wait \$$                  ## No, so wait to capture exit status
+        exit \$?                  ##     Exit w/foreground's exit stat
+    fi                            ## Yes, so..
+    sleep \$intvl                 ## * Sleep for interval before asking again
+    tout=\$((tout - intvl))       ## * Decrease timeout
+done                              ## Out of time, and killer will do it's job
+    kill -s TERM \$$              ## Try to TERM foreground process
+    sleep \$dly                   ## Delay the KILL a bit
+    if ps -o pid -p \$$; then     ## Is foreground still running?
+        kill -s KILL \$$          ## Yes, so kill it
+        sleep \$dly               ## Await before checking again
+        if ps -o pid -p \$$; then ## If it still running then..
+            exit 3                ## Finish w/distinctive error
+        fi                        
+        exit 2                    ## Process didn't TERMINATED but KILLED
+    fi
+    exit 1                        ## Process TERMINATED
+} >/dev/null 2>&1 &               ## Fork nullifying output
+exec $cmd"                        ## Replace foreground execution w/command's
+}
+_TMPFFID=0  ## Unique incremental temporary fifo ID
+_mkTFfo() { #@ DESCRIPTION: Creates single temp fifo in /tmp for each invocation
+            #@              during current instance of script updating unique
+            #@              global ID and storing full path in $1 name.
+            #@ USAGE: _mkTFfo NAME
+            #@        /!\ - WARNINGS: - /!\
+            #@        * $1 must be a valid name
+            #@        * DO NOT CALL DIRECTLY, use mkTFfo() wrapper instead.
+    # Local variables ("local" must be function's first statement)
+    local n tffpth
+    # Initialize fifo's path and an attempts counter
+    tffpth=/tmp/${0##*/}.$$.$_TMPFFID.tmp n=0
+    # Try create while fifo exists, limiting attempts number
+    while ! mkfifo "$tffpth" 1>/dev/null 2>&1 && [ $n -lt 100 ]; do
+        if [ -e $tffpth ]; then                             ## Ffo lready there?
+            _TMPFFID=$((_TMPFFID < 999 ? _TMPFFID + 1 : 0)) ## Yes, increase ID
+            tffpth=/tmp/${0##*/}.$$.$_TMPFFID.tmp           ## and set new path
+        else                                                ## No, so problem
+            errmsg "Failed to create named pipe"            ## Display error msg
+            return 1                                        ## Report to calling
+        fi                                                  ## environment.
+        n=$((n + 1))                                ## Increase attempts counter
+    done                                            ## Now sure that ffo exists
+    _TMPFFID=$((_TMPFFID < 999 ? _TMPFFID + 1 : 0)) ## Increase global ID
+    if [ $n -gt 100 ]; then                         ## Loop finished by limit?
+        errmsg "Too many named pipes"               ## Assume too many fifos
+        return 2                                    ## Finish w/errors
+    fi
+    setvar $1 "$tffpth"
+}
+mkTFfo() { #@ DESCRIPTION: Creates single temp fifo in /tmp using _mkTFfo()
+           #@ USAGE: mkTFfo NAME
+    local _$1                ## Create prefixed storage for wrapped output
+    _mkTFfo _$1 || return $? ## Call wrapped or finish preserving error status
+    getvar $1 _$1            ## Set referenced name w/wrapped output
+}
+##
+## -- Script specific functions  -----------------------------------------------
+readPIDF() { #@ DESCRIPTION: Tries to read a valid PID from pidfile in $2 path,
+             #@              storing read pid in $1 name on success.
+             #@ USAGE: readPIDF NAME [ PATH ]
+    IFS= read -r _RPLY <"${2:-/tmp/${0##*/}.pid}"
+    case $? in
+        1)        ## EOF reached
+            if [ "X$_RPLY" = X ]; then ## EOF reached before EOL?
+                errmsg "Failed to read from PIDfile ${2:-/tmp/${0##*/}.pid}"
+                return 1               ## Finish w/errors
+            fi ;; ## Now sure that we read something from file, so check it
+        [!0]*)    ## Something went wrong while reading file
+            errmsg "Unable to read from PIDfile ${2:-/tmp/${0##*/}.pid}"
+            return 1 ;;
+    esac
+    case $_RPLY in     
+        0|1|*[!0-9]*)   ## Did we get a valid PID
+            errmsg "Bad PID read from PIDfile ${2:-/tmp/${0##*/}.pid}"
+            return 1 ;; ## Finish w/errors
+    esac                ## Now sure that numeric PID read from file
+    setvar $1 $_RPLY    ## Write read PID to referenced name            
+
+}
+end() { #@ DESCRIPTION:
+        #@ USAGE: end INT
+    # Display message to user
+    printf "\n"
+    stdmsg "Terminated by signal!"
+    # Try to remove all /tmp/${0##*/}.$$.*.tmp fifos
+    rm -f /tmp/${0##*/}.$$.*.tmp
+    # Try to remove pidfile
+    rm -f "$_PIDFILE" >/dev/null 2>&1
+    if [ -e "$_PIDFILE" ]; then
+        errmsg "Failed to remove pidfile."
+    fi
+    # Report partially removed files ammount
+    if [ $_TMPFLSRM -gt 0 ]; then
+        printf -- "               %s\n" "Partially removed $_TMPFLSRM files."
+    fi
+    # Finish w/given exit status
+    stdmsg "$_PRGNME finishes."
+    printf "\n"
+    exit $1
+
+}
+pspnnr() { #@ DESCRIPTION:
+           #@ USAGE: pspnnr [ INT ]
+    local c fmt='\033[s==> %s\033[u'
+    case $(($1%4)) in
+        0) c=- ;;
+        1) c='\' ;;
+        2) c='|' ;;
+        3) c=/ ;;
+    esac
+    printf "$fmt" $c
+}
+##
+## -- Main ---------------------------------------------------------------------
+main() {
+    # Local variables ("local" must be function's first statement)
+    local pid ctdir ftyplst cftyp ptrnlst tffo ftchpid nowsecs flesecs dpid s
+    stdmsg "$_PRGNME starts"
+    #
+    # Additional runtime configuration
+    stdmsg "Loading configuration.."
+    IFS=$_SP$_HT$_LF  ## Reset IFS as it should be by default
+    umask 077         ## Allow only owner to access created files
+    unalias -a        ## Destroy any alias that may change externals execution
+    set -m            ## Force job control ON
+    sleep 1
+    # Check for already running instance
+    stdmsg "done."
+    stdmsg "Checking for already running instance.."
+    if [ -e "$_PIDFILE" ]; then
+        readPIDF pid "$_PIDFILE" &&
+            errmsg "$_PRGNME is already running on PID=$pid" ||
+                errmsg "Another instance of $_PRGNAME could be running."
+        return 1
+    fi
+    sleep 1
+    stdmsg "Done."
+    # Try create pidfile
+    stdmsg "Creating pidfile.."
+    if ! printf "%d\n" $$ >"${_PIDFILE:-/tmp/${0##*/}.pid}"; then
+        errmsg "Failed to create pidfile ${_PIDFILE:-/tmp/${0##*/}.pid}"
+        return 2
+    fi
+    sleep 1
+    stdmsg "Done."
+    # Start signal traps
+    stdmsg "Starting traps.."
+    trap 'end 3' INT TERM KILL
+    sleep 1
+    stdmsg "Done."
+    # Process all elements from directory list
+    while [ "X$_TMPDIRLST" != X ]; do  ## Still have temp dirs in list?
+        ctdir=${_TMPDIRLST%%$_LF*} r=0 ## Get curr. dir from list
+        _TMPFLSRM=0                    ## Reset removed files counter
+        # Fetch pattern list for current temp dir
+        stdmsg "Fetching pattern list for $ctdir.."
+        ptrnlst= ftyplst=$_FTYPELST    ## Init. patterns and local types lists
+        if [ "X$ftyplst" = X -o "$ftyplst" = "*" ]; then
+            ptrnlst="\"$ctdir\"/*"
+        else
+            while [ "X$ftyplst" != X ]; do ## Still have types in list?
+                cftyp=${ftyplst%%$_LF*}    ## Get current type
+                # Append <currnt. path>/*<currnt. type> to patterns list
+                ptrnlst=${ptrnlst+"$ptrnlst "}"\"$ctdir\"/*\"$cftyp\""
+                case $ftyplst in           ## Does types list contain an EOL?
+                    *$_LF*) ftyplst=${ftyplst#*$_LF} ;; ## Yes, rm all up to it
+                    *) ftyplst= ;;                      ## No, assume list ended
+                esac
+            done
+        fi
+        sleep 1
+        stdmsg "Done."
+        # Retrieve matching files list from current temp dir
+        stdmsg "Fetching files from $ctdir sorted by mtime.."
+        ## Try Create a temp fifo to store results
+        if ! mkTFfo tffo; then  
+            errmsg "Unable to create a temporary pipe"
+            end 3            ## Fail if not able to
+        fi
+        ## Try get now seconds since epoc
+        if ! nowsecs=$(date +%s 2>/dev/null); then
+            errmsg "Unable to get now seconds since epoch"
+            end 3
+        fi
+        ## Expand list of patterns before passing them to stat. Don't mind if it
+        ## fails due to limited access or non-existing files, just list if able.
+        ## Then pipe result to sort files by first field, which is defined as 
+        ## mtime seconds since epoch. Also discard any error messages.
+        { eval "stat -c \"%Y$_HT%n\" -- $ptrnlst" |
+                sort -nt "$_HT" -k 1,1 >$tffo; } 2>/dev/null &
+        ftchpid=$!
+        sleep 1
+        stdmsg "Removing files from $ctdir.."
+        # Start background dummy to later check elapsed time
+        { sleep 1 & } 2>/dev/null
+        dpid=$! s=0
+        ## Read from named pipe line by line
+        { while IFS=$_HT read -r flesecs _RPLY; do
+              if [ -f "$_RPLY" ]; then
+                  case $flesecs in
+                      "" | *[!0-9]*) continue ;;
+                  esac
+                  if [ $(((nowsecs - flesecs)/60)) -gt ${_MINSKEEP:-0} ]; then
+                      tmout 1 fuser -f "$_RPLY"
+                      case $? in
+                          1)
+                              rm -f "$_RPLY"
+                              [ ! -e "$_RPLY" ] &&
+                                  _TMPFLSRM=$((_TMPFLSRM + 1)) ;;
+                      esac
+                  else
+                      echo "Keeping from $_RPLY onwards    : $flesecs"
+                      break
+                  fi
+              fi
+              if ! ps -o pid -p $dpid >/dev/null 2>&1; then
+                  pspnnr $s
+                  { sleep 1 & } 2>/dev/null
+                  dpid=$!
+                  s=$((s + 1))
+              fi
+          done <$tffo; } 2>/dev/null
+        stdmsg "Done."\
+               "Files removed: $r"
+        if ! wait $ftchpid; then
+            errmsg "Failed to get sorted-by-mtime tmp. file list"
+            end 3
+        fi
+        rm -f $tffo
+        stdmsg "Done."
+        case $_TMPDIRLST in            ## Does tmp files list contain an EOL?
+            *$_LF*) _TMPDIRLST=${_TMPDIRLST#*$_LF} ;; ## Yes, rm all up to it
+            *) _TMPDIRLST= ;;                         ## No, assume end of list
+        esac
+    done
+}
+##
+## -- Run! ---------------------------------------------------------------------
+main

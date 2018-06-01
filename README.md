@@ -1,2 +1,2 @@
-# Safeclean
-Safely remove files inside directory
+# Tmpclean
+Eficiently removes temp. files from dirs
