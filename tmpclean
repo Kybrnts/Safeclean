@@ -1,20 +1,30 @@
 #!/bin/sh
 #: Title       : Tmpclean
-#: Date        : 2016-05-17
+#: Date        : 2018-05-31
 #: Author      : "Kybernetes" <correodelkybernetes@gmail.com>
-#: Version     : 1.1.0
+#: Version     : 1.0.0
 #: Description : Executable Dash shell script
-#:             : Efficiently removes files from temp. dirs using
+#:             : Safely removes large ammounts of  files from temp. dirs using
 #:             : * File types in names (a.k.a. extension);
 #:             : * Mtime in minutes of each temp file;
 #:             : Avoiding to remove files that are being used by a process.
+#: Workflow    : For each directory in $_TMPDIRLST, and for each file type in
+#:             : $_FTYPELST, it creates a file glob pattern that is expanded
+#:             : and matching files passed as args. to a pipeline which first 
+#:             : gets for each file its mtime in minutes since Epoch, and file's
+#:             : full path, joining both in a sorted list. Then loops through 
+#:             : that list, and if file's mtime is old enough (see $_MINSKEEP), 
+#:             : tries to remove it only if file is not currently being used by 
+#:             : another proc. The idea is that even for such a large number of
+#:             : matching temp. files that a single pipeline won't be able to
+#:             : handle them as args, it can still make it by splitting the task
+#:             : in several pipelines (one for e/file type) for each temp. dir.
 #: Options     : N/A
 ##
 ## -- Externals required for execution -----------------------------------------
 type rm >/dev/null || exit 1    ## Remove files
 type date >/dev/null || exit 1  ## Get system's time
 type sleep >/dev/null || exit 1 ## Delay execution for some time
-type chmod >/dev/null || exit 1 ## Set file's mode
 type ps >/dev/null || exit 1    ## Get current running procs
 type stat >/dev/null || exit 1  ## Get file status
 type fuser >/dev/null || exit 1 ## Identiry procs. using files
@@ -28,19 +38,25 @@ readonly _HT="	" ## Horizontal tab
 readonly _LF="
 "                 ## End of line (line feed)
 # Script's name
-_PRGNME=Safeclean
+_PRGNME=Tmpclean
 # Execution blocking currently running instance's pid file
 _PIDFILE=/tmp/${0##*/}.pid
-# Allowed-to-clear extension EOL separation list (use empty for any)
-_FTYPELST="*"
+# Allowed-to-clear extension EOL separation list
+_FTYPELST=".[Pp][Dd][Ff]
+.[Aa][Aa][Cc]
+.[Oo][Dd][Tt]
+.[Jj][Pp]*[Gg]
+.[Pp][Nn][Mm]"
 # Allowed-to-search EOL separated directory list
-_TMPDIRLST="/usr/share/tomcat/apia/fiscalia/tmpFileStorage"
-#_TMPDIRLST="/usr/share/tomcat/apia/fiscalia/tmpFileStorage
-#/usr/share/tomcat/apia/webapps/fiscalia/sippau/carpetaCaso/tmp"
+_TMPDIRLST="/usr/share/app1/tmpFileStorage
+/usr/share/app2/tmpFileStorage
+/usr/share/app3/tmpFileStorage"
 # Temp. files max mtime to keep from now, in minutes
-_MINSKEEP=120
+_MINSKEEP=180
 # Temp. files removed for a given temp. dir
 _TMPFLSRM=0
+# Terminated by signal?
+_SIGTRMND=false
 ##
 ## -- General purpose functions  -----------------------------------------------
 stdmsg() { #@ DESCRIPTION: Print messages to STDOUT
@@ -95,7 +111,7 @@ wqargs() { #@ DESCRIPTION: Weak-quotes all but 1st arg., storing them in order
     # Local variables ("local" must be function's first statement)
     local _$1            ## Prefix name to safely pass it to wrapped function
     eval "getvar _$1 $1" ## Store previous content of $1 referenced name
-    set -- "$@" _$1      ## Append name at the end as rquired by wrapped
+    set -- "$@" _$1      ## Append name at the end as required by wrapped func.
     shift                ## Now safely remove first arg
     _wqargs "$@"         ## Issue wrapped function passing all args and name
     eval "getvar \${$##_} \${$#}" ## $1 is no longer initial name after shift,
@@ -113,6 +129,7 @@ tmout() { #@ DESCRIPTION: Execute command w/a timeout upon whose expiration
     wqargs cmd ${1+"$@"}
     shift $#
     sh -c "{                      ## Start killer process in backgnd
+set -m                            ## Enable job control
 intvl=1 dly=2 tout=$tout          ## Initialize interval, delay and timeout
 while [ \$tout -gt 0 ]; do        ## While we still have time
     if ! ps -o pid -p \$$; then   ## Frgnd proc running? ($$ expnds before back)
@@ -168,6 +185,7 @@ _mkTFfo() { #@ DESCRIPTION: Creates single temp fifo in /tmp for each invocation
 }
 mkTFfo() { #@ DESCRIPTION: Creates single temp fifo in /tmp using _mkTFfo()
            #@ USAGE: mkTFfo NAME
+    # Local variables ("local" must be function's first statement)
     local _$1                ## Create prefixed storage for wrapped output
     _mkTFfo _$1 || return $? ## Call wrapped or finish preserving error status
     getvar $1 _$1            ## Set referenced name w/wrapped output
@@ -196,11 +214,11 @@ readPIDF() { #@ DESCRIPTION: Tries to read a valid PID from pidfile in $2 path,
     setvar $1 $_RPLY    ## Write read PID to referenced name            
 
 }
-end() { #@ DESCRIPTION:
+end() { #@ DESCRIPTION: Finishes exec. correctly, cleaning up files, displaying
+        #@              remaining information and exiting from program w/$1
+        #@              specified exit status. It also adds support for handling
+        #@              signals.
         #@ USAGE: end INT
-    # Display message to user
-    printf "\n"
-    stdmsg "Terminated by signal!"
     # Try to remove all /tmp/${0##*/}.$$.*.tmp fifos
     rm -f /tmp/${0##*/}.$$.*.tmp
     # Try to remove pidfile
@@ -209,8 +227,9 @@ end() { #@ DESCRIPTION:
         errmsg "Failed to remove pidfile."
     fi
     # Report partially removed files ammount
-    if [ $_TMPFLSRM -gt 0 ]; then
-        printf -- "               %s\n" "Partially removed $_TMPFLSRM files."
+    if $_SIGTRMND && [ $_TMPFLSRM -gt 0 ]; then
+        printf "\n"
+        stdmsg "Partially removed $_TMPFLSRM files."
     fi
     # Finish w/given exit status
     stdmsg "$_PRGNME finishes."
@@ -218,24 +237,29 @@ end() { #@ DESCRIPTION:
     exit $1
 
 }
-pspnnr() { #@ DESCRIPTION:
-           #@ USAGE: pspnnr [ INT ]
-    local c fmt='\033[s==> %s\033[u'
-    case $(($1%4)) in
+prntspnr() { #@ DESCRIPTION: Print a char according to $1 int. value, returning
+             #@              cursor to its original position after printing,
+             #@              overwriting it upon subsequent calls. This creates
+             #@              the illusion of a spinning bar on the screen.
+             #@ USAGE: prntspnr [ INT ]
+    # Local variables ("local" must be function's first statement)
+    local c fmt='\033[s==> %s\033[u' ## Char to show and format w/cursor mvment.
+    case $(($1%4)) in                ## Select one of only 4 positions
         0) c=- ;;
         1) c='\' ;;
         2) c='|' ;;
         3) c=/ ;;
     esac
-    printf "$fmt" $c
+    printf "$fmt" $c                 ## Display char.
 }
 ##
 ## -- Main ---------------------------------------------------------------------
 main() {
     # Local variables ("local" must be function's first statement)
-    local pid ctdir ftyplst cftyp ptrnlst tffo ftchpid nowsecs flesecs dpid s
-    stdmsg "$_PRGNME starts"
-    #
+    local tdy ctdir ftyplst cftyp pttrn tffo ftchpid nowsecs cfile flesecs \
+          dpid s
+    tdy=$(date +"%Y-%m-%d" 2>/dev/null) || tdy=yyyy-mm-dd
+    stdmsg "$tdy $_PRGNME starts"
     # Additional runtime configuration
     stdmsg "Loading configuration.."
     IFS=$_SP$_HT$_LF  ## Reset IFS as it should be by default
@@ -264,94 +288,143 @@ main() {
     stdmsg "Done."
     # Start signal traps
     stdmsg "Starting traps.."
-    trap 'end 3' INT TERM KILL
+    trap 'printf "\nTerminated by signal!"; _SIGTRMND=true; end 3' INT TERM KILL
     sleep 1
     stdmsg "Done."
+    ## Try get now seconds since epoc
+    if ! nowsecs=$(date +%s 2>/dev/null); then
+        errmsg "Unable to get now seconds since epoch"
+        end 3
+    fi    
     # Process all elements from directory list
-    while [ "X$_TMPDIRLST" != X ]; do  ## Still have temp dirs in list?
-        ctdir=${_TMPDIRLST%%$_LF*} r=0 ## Get curr. dir from list
-        _TMPFLSRM=0                    ## Reset removed files counter
-        # Fetch pattern list for current temp dir
-        stdmsg "Fetching pattern list for $ctdir.."
-        ptrnlst= ftyplst=$_FTYPELST    ## Init. patterns and local types lists
-        if [ "X$ftyplst" = X -o "$ftyplst" = "*" ]; then
-            ptrnlst="\"$ctdir\"/*"
-        else
-            while [ "X$ftyplst" != X ]; do ## Still have types in list?
-                cftyp=${ftyplst%%$_LF*}    ## Get current type
-                # Append <currnt. path>/*<currnt. type> to patterns list
-                ptrnlst=${ptrnlst+"$ptrnlst "}"\"$ctdir\"/*\"$cftyp\""
-                case $ftyplst in           ## Does types list contain an EOL?
-                    *$_LF*) ftyplst=${ftyplst#*$_LF} ;; ## Yes, rm all up to it
-                    *) ftyplst= ;;                      ## No, assume list ended
-                esac
-            done
-        fi
-        sleep 1
-        stdmsg "Done."
-        # Retrieve matching files list from current temp dir
-        stdmsg "Fetching files from $ctdir sorted by mtime.."
-        ## Try Create a temp fifo to store results
-        if ! mkTFfo tffo; then  
-            errmsg "Unable to create a temporary pipe"
-            end 3            ## Fail if not able to
-        fi
-        ## Try get now seconds since epoc
-        if ! nowsecs=$(date +%s 2>/dev/null); then
-            errmsg "Unable to get now seconds since epoch"
-            end 3
-        fi
-        ## Expand list of patterns before passing them to stat. Don't mind if it
-        ## fails due to limited access or non-existing files, just list if able.
-        ## Then pipe result to sort files by first field, which is defined as 
-        ## mtime seconds since epoch. Also discard any error messages.
-        { eval "stat -c \"%Y$_HT%n\" -- $ptrnlst" |
-                sort -nt "$_HT" -k 1,1 >$tffo; } 2>/dev/null &
-        ftchpid=$!
-        sleep 1
-        stdmsg "Removing files from $ctdir.."
-        # Start background dummy to later check elapsed time
-        { sleep 1 & } 2>/dev/null
-        dpid=$! s=0
-        ## Read from named pipe line by line
-        { while IFS=$_HT read -r flesecs _RPLY; do
-              if [ -f "$_RPLY" ]; then
-                  case $flesecs in
-                      "" | *[!0-9]*) continue ;;
-                  esac
-                  if [ $(((nowsecs - flesecs)/60)) -gt ${_MINSKEEP:-0} ]; then
-                      tmout 1 fuser -f "$_RPLY"
-                      case $? in
-                          1)
-                              rm -f "$_RPLY"
-                              [ ! -e "$_RPLY" ] &&
-                                  _TMPFLSRM=$((_TMPFLSRM + 1)) ;;
-                      esac
-                  else
-                      echo "Keeping from $_RPLY onwards    : $flesecs"
-                      break
+    while [ "X$_TMPDIRLST" != X ]; do    ## Still have temp dirs in list?
+        ctdir=${_TMPDIRLST%%$_LF*}       ## Get curr. dir from list
+        ftyplst=$_FTYPELST               ## Reset local file type list
+        if [ -d "$ctdir" ]; then         ## Skip if not existent
+            stdmsg "Cleaning files for $ctdir.."
+            # Fetch files for each file type from list
+            while [ "X$ftyplst" != X ]; do     ## Still have types in list?
+                cftyp=${ftyplst%%$_LF*}        ## Get currt type from list
+                pttrn="\"$ctdir\"/*$cftyp" ## Set pattern for matching files
+                _TMPFLSRM=0                    ## Reset rm files cntr. for type
+                stdmsg "Fetching *$cftyp files sorted by mtime.."
+                ## Try Create a temp fifo to store results
+                if ! mkTFfo tffo; then  
+                    errmsg "Unable to create a temporary pipe"
+                    end 3            ## Fail if not able to
+                fi
+                ## Expand pttrn before passing matching fles to stat. Don't mind
+                ## if it fails due to limited access or non-existing, just list
+                ## if able. Then pipe result to sort files by first field, which
+                ## is mtime seconds since epoch. Also discard any error messages
+                { eval "stat -c \"%Y$_HT%n\" -- $pttrn" |
+                        sort -nt "$_HT" -k 1,1 >$tffo; } 2>/dev/null &
+                ftchpid=$!
+                sleep 1
+                stdmsg "Removing older than ${_MINSKEEP:-0} minutes.."
+                ## Start background dummy to later check elapsed time
+                { sleep 2 & } 2>/dev/null
+                dpid=$! s=0 ## Get dummy's pid and reset spinner counter
+                ## Read from named pipe line by line
+                { while IFS= read -r _RPLY; do
+                      flesecs=${_RPLY%%$_HT*}  ## Get mtime from first col
+                      cfile=${_RPLY#*$_HT}     ## Get path from second col
+                      if [ -f "$cfile" ]; then ## If not regular file, skip
+                          case $flesecs in     ## if invalid mtime format, skip
+                              "" | *[!0-9]*) continue ;;
+                          esac               ## Is current file in remove range?
+                          if [ $(((nowsecs - flesecs)/60)) -gt ${_MINSKEEP:-0} ]
+                          then               ## Yes so..
+                              tmout 1 fuser -f "$cfile" ## Chk. if used or tmout
+                              case $? in                ## Skip if above fails
+                                  1)                    ## File is not used?
+                                      rm -f "$cfile"      ## Try remove, if
+                                      [ ! -e "cfile" ] && ## removed count
+                                          _TMPFLSRM=$((_TMPFLSRM + 1)) ;;
+                              esac
+                          else              ## No, so as files are time-sorted,
+                              break         ## remaining ones are to be skipped
+                          fi
+                      fi
+                      ## As per backgrounded dummy, Is time to display spinner?
+                      if ! ps -o pid -p $dpid >/dev/null 2>&1
+                      then                                     ## If dummy died
+                          prntspnr $s                          ## Display
+                          { sleep 2 & } 2>/dev/null            ## Spawn new
+                          dpid=$!                              ## Reset pid
+                          s=$((s + 1))                         ## inc. counter
+                      fi
+                  done <$tffo; } 2>/dev/null
+                stdmsg "Done." "Files removed: $_TMPFLSRM"                
+                wait $ftchpid ||       ## Catch exit status of fetch process
+                    [ $? -lt 127 ] &&  ## Report only fetch errors
+                        errmsg "Failure while fetching softed file list"
+                rm -f $tffo               ## Remove no longer needed fifo
+                case $ftyplst in          ## Does types list contain an EOL?
+                    *$_LF*) ftyplst=${ftyplst#*$_LF} ;; ## Yes, rm any char
+                    *) ftyplst= ;;                      ## up to it;
+                esac                                    ## No, assume end of
+            done                                        ## list reached.
+            # Now fetch all remaining non-matching files        
+            pttrn="\"$ctdir\"/*" ## Set pattern for matching remaining files
+            _TMPFLSRM=0          ## Reset removed files counter
+            stdmsg "Fetching remaining files sorted by mtime.."
+            ## Try Create a temp fifo to store results
+            if ! mkTFfo tffo; then  
+                errmsg "Unable to create a temporary pipe"
+                end 3            ## Fail if not able to
+            fi
+            ## Expand pattern before passing matching files to stat, then pipe
+            ## results to sort as before.
+            { eval "stat -c \"%Y$_HT%n\" -- $pttrn" |
+                    sort -nt "$_HT" -k 1,1 >$tffo; } 2>/dev/null &
+            ftchpid=$!
+            stdmsg "Removing older than ${_MINSKEEP:-0} minutes.."
+            ## Process output from named pipe as before
+            { sleep 2 & } 2>/dev/null
+            dpid=$! s=0
+            { while IFS= read -r _RPLY; do
+                  flesecs=${_RPLY%%$_HT*}  ## Get file's mtime from first col
+                  cfile=${_RPLY#*$_HT}     ## Get file's path from second col
+                  if [ -f "$cfile" ]; then ## If not regular file, skip
+                      case $flesecs in     ## if invalid mtime format, skip
+                          "" | *[!0-9]*) continue ;;
+                      esac                 ## Is current file in remove range?
+                      if [ $(((nowsecs - flesecs)/60)) -gt ${_MINSKEEP:-0} ]
+                      then                 ## Yes so..
+                          tmout 1 fuser -f "$cfile" ## Check if used for a while
+                          case $? in                ## Skip if above fails
+                              1)                    ## If file is not being used
+                                  rm -f "$cfile"       ## Try to remove file
+                                  [ ! -e "cfile" ] &&  ## If removed count
+                                      _TMPFLSRM=$((_TMPFLSRM + 1)) ;;
+                          esac
+                      else                 ## No, so as files are time-sorted,
+                          break            ## remaining ones are to be skipped
+                      fi
                   fi
-              fi
-              if ! ps -o pid -p $dpid >/dev/null 2>&1; then
-                  pspnnr $s
-                  { sleep 1 & } 2>/dev/null
-                  dpid=$!
-                  s=$((s + 1))
-              fi
-          done <$tffo; } 2>/dev/null
-        stdmsg "Done."\
-               "Files removed: $r"
-        if ! wait $ftchpid; then
-            errmsg "Failed to get sorted-by-mtime tmp. file list"
-            end 3
+                  ## As per backgrounded dummy, Is it time to display spinner?
+                  if ! ps -o pid -p $dpid >/dev/null 2>&1; then ## If dummy died
+                      prntspnr $s                               ## Display
+                      { sleep 2 & } 2>/dev/null                 ## Spawn new
+                      dpid=$!                                   ## Reset pid
+                      s=$((s + 1))                              ## inc. counter
+                  fi
+              done <$tffo; } 2>/dev/null
+            stdmsg "Done." "Files removed: $_TMPFLSRM"
+            wait $ftchpid ||       ## Catch exit status of fetch process
+                [ $? -lt 127 ] &&  ## Report only fetch errors
+                    errmsg "Failure while fetching softed file list"
+            rm -f $tffo            ## Remove no longer needed fifo
         fi
-        rm -f $tffo
         stdmsg "Done."
+        ## Continue w/next directory
         case $_TMPDIRLST in            ## Does tmp files list contain an EOL?
             *$_LF*) _TMPDIRLST=${_TMPDIRLST#*$_LF} ;; ## Yes, rm all up to it
             *) _TMPDIRLST= ;;                         ## No, assume end of list
         esac
     done
+    end 0
 }
 ##
 ## -- Run! ---------------------------------------------------------------------
