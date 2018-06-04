@@ -22,13 +22,18 @@
 #: Options     : N/A
 ##
 ## -- Externals required for execution -----------------------------------------
-type rm >/dev/null || exit 1    ## Remove files
-type date >/dev/null || exit 1  ## Get system's time
-type sleep >/dev/null || exit 1 ## Delay execution for some time
-type ps >/dev/null || exit 1    ## Get current running procs
-type stat >/dev/null || exit 1  ## Get file status
-type fuser >/dev/null || exit 1 ## Identiry procs. using files
-type timeout >/dev/null || exit 1
+type /bin/rm >/dev/null &&     ## Remove files
+rm() { /bin/rm ${1+"$@"}; } || exit 1
+type /bin/date >/dev/null &&   ## Get system's time
+date() { /bin/date ${1+"$@"}; } || exit 1
+type /bin/sleep >/dev/null &&  ## Delay execution for some seconds
+sleep() { /bin/sleep ${1+"$@"}; } || exit 1  
+type /bin/ps >/dev/null &&     ## Get current running procs
+ps() { /bin/ps ${1+"$@"}; } || exit 1
+type /bin/stat >/dev/null &&   ## Get file status
+stat() { /bin/stat ${1+"$@"}; } || exit 1
+type /sbin/fuser >/dev/null && ## Identiry procs. using files
+fuser() { /bin/fuser ${1+"$@"}; } || exit 1 
 ##
 ## -- Runtime config. ----------------------------------------------------------
 _RPLY=            ## Internal read command reply;
@@ -264,7 +269,7 @@ main() {
     stdmsg "Loading configuration.."
     IFS=$_SP$_HT$_LF  ## Reset IFS as it should be by default
     umask 077         ## Allow only owner to access created files
-    unalias -a        ## Destroy any alias that may change externals execution
+    unalias -a        ## Clear any alias that may change any command execution
     set -m            ## Force job control ON
     sleep 1
     # Check for already running instance
@@ -358,7 +363,7 @@ main() {
                 stdmsg "Done." "Files removed: $_TMPFLSRM"                
                 wait $ftchpid ||       ## Catch exit status of fetch process
                     [ $? -lt 127 ] &&  ## Report only fetch errors
-                        errmsg "Failure while fetching softed file list"
+                        errmsg "Failure while fetching sorted file list"
                 rm -f $tffo               ## Remove no longer needed fifo
                 case $ftyplst in          ## Does types list contain an EOL?
                     *$_LF*) ftyplst=${ftyplst#*$_LF} ;; ## Yes, rm any char
@@ -414,7 +419,7 @@ main() {
             stdmsg "Done." "Files removed: $_TMPFLSRM"
             wait $ftchpid ||       ## Catch exit status of fetch process
                 [ $? -lt 127 ] &&  ## Report only fetch errors
-                    errmsg "Failure while fetching softed file list"
+                    errmsg "Failure while fetching sorted file list"
             rm -f $tffo            ## Remove no longer needed fifo
         fi
         stdmsg "Done."
